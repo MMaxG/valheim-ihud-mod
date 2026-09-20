@@ -10,7 +10,7 @@ using System.Globalization;
 using System.Linq;
 using System.Reflection;
 
-[BepInPlugin("iHUD", "iHUD", "1.0.0")]
+[BepInPlugin("iHUD", "iHUD", "1.1.0")]
 public sealed class iHUDPlugin : BaseUnityPlugin
 {
     internal static bool Enabled = true;
@@ -43,6 +43,12 @@ public sealed class iHUDPlugin : BaseUnityPlugin
     internal static ConfigEntry<bool> GuardianPowerHandling = null!;
     internal static ConfigEntry<bool> MinimapHandling = null!;
     internal static ConfigEntry<bool> ShowAllOnInventory = null!;
+    internal static ConfigEntry<bool> ToggleMessage = null!;
+    internal static ConfigEntry<bool> ShipHudHandling = null!;
+    internal static ConfigEntry<float> ShipHudHideDelay = null!;
+    internal static ConfigEntry<float> ShipHudFadeDuration = null!;
+    internal static ConfigEntry<bool> ShipHudHideEntirely = null!;
+    internal static ConfigEntry<bool> ShipHudSpeedIndicatorHandling = null!;
 
     // ---------------------------------------------------------------------
     // Health
@@ -121,6 +127,11 @@ public sealed class iHUDPlugin : BaseUnityPlugin
             return;
 
         HudDisplayManager.Tick();
+    }
+
+    private void LateUpdate()
+    {
+        HotkeyBarController.LateApply();
     }
 
     private bool previousInventoryState;
@@ -214,6 +225,13 @@ public sealed class iHUDPlugin : BaseUnityPlugin
         }
 
         Log.LogInfo($"iHUD {(enabled ? "enabled" : "disabled")}");
+
+        if (ToggleMessage.Value && Player.m_localPlayer != null)
+        {
+            Player.m_localPlayer.Message(
+                MessageHud.MessageType.TopLeft,
+                enabled ? "iHUD enabled" : "iHUD disabled");
+        }
     }
 
     private void BindConfig()
@@ -316,6 +334,12 @@ public sealed class iHUDPlugin : BaseUnityPlugin
             true,
             "Allow iHUD to control minimap visibility.");
 
+        ShipHudHandling = Config.Bind(
+            "Modules",
+            "Ship HUD Handling",
+            true,
+            "Fade the ship HUD (sail/speed setting) when it is not needed.");
+
         ShowAllOnInventory = Config.Bind(
             "General",
             "Show All On Inventory",
@@ -323,6 +347,12 @@ public sealed class iHUDPlugin : BaseUnityPlugin
             "Force all HUD elements to be visible while the inventory is " +
             "open. When off, elements keep following their normal " +
             "hide/fade rules with the inventory open.");
+
+        ToggleMessage = Config.Bind(
+            "General",
+            "Toggle Message",
+            true,
+            "Show a short on-screen message when iHUD is toggled on/off.");
 
         // -----------------------------------------------------------------
         // Health
@@ -451,6 +481,36 @@ public sealed class iHUDPlugin : BaseUnityPlugin
             "Ready Show Duration",
             5f,
             "Seconds the guardian power bar remains visible when a power comes off cooldown.");
+
+        // -----------------------------------------------------------------
+        // Ship HUD
+        // -----------------------------------------------------------------
+
+        ShipHudHideDelay = Config.Bind(
+            "Ship HUD",
+            "Hide Delay",
+            5f,
+            "Seconds the ship HUD remains fully visible after the sail setting changes.");
+
+        ShipHudFadeDuration = Config.Bind(
+            "Ship HUD",
+            "Fade Duration",
+            4f,
+            "Seconds used to fade the ship HUD.");
+
+        ShipHudHideEntirely = Config.Bind(
+            "Ship HUD",
+            "Hide Entirely",
+            false,
+            "If enabled, the ship HUD is never shown (it does not appear when the sail setting changes).");
+
+        ShipHudSpeedIndicatorHandling = Config.Bind(
+            "Ship HUD",
+            "Speed Indicator Handling",
+            false,
+            "If enabled, the speed arrows above the steering wheel also " +
+            "fade when they are not needed. Off by default so the current " +
+            "speed setting stays visible.");
 
         // -----------------------------------------------------------------
         // Minimap
@@ -971,6 +1031,7 @@ internal static class HudDisplayManager
         StatusEffectController.ShowImmediately();
         HotkeyBarController.ShowImmediately();
         GuardianPowerController.ShowImmediately();
+        ShipHudController.ShowImmediately();
         CrosshairController.ShowImmediately();
 
         // Minimap intentionally excluded.
@@ -989,6 +1050,7 @@ internal static class HudDisplayManager
         StatusEffectController.HideImmediately();
         HotkeyBarController.HideImmediately();
         GuardianPowerController.HideImmediately();
+        ShipHudController.HideImmediately();
         CrosshairController.HideImmediately();
     }
 
@@ -1005,6 +1067,7 @@ internal static class HudDisplayManager
         StatusEffectController.RestoreDefault();
         HotkeyBarController.RestoreDefault();
         GuardianPowerController.RestoreDefault();
+        ShipHudController.RestoreDefault();
         CrosshairController.RestoreDefault();
         MinimapController.RestoreDefault();
     }
@@ -1876,21 +1939,70 @@ internal static class HotkeyBarController
     private static readonly HudFadeState state =
         new HudFadeState();
 
-    private static CanvasGroup? group;
+    // Every HotkeyBar we have seen. Other mods can add extra bars.
+    private static readonly List<CanvasGroup> groups =
+        new List<CanvasGroup>();
 
     private static int previousItemHash = -1;
 
+    // True while iHUD is driving the bar's alpha. Used to restore the
+    // default once (instead of every frame) when iHUD stops controlling it,
+    // so other mods can control the bar in that case.
+    private static bool controlling;
+
+    // HotkeyBar.UpdateIcons is not guaranteed to run every frame (other
+    // mods can make it event-driven), so it is only used to discover the
+    // bar. The fade itself is driven by Tick (Update) and LateApply
+    // (LateUpdate), which run every frame.
     public static void Postfix(HotkeyBar __instance)
     {
-        group = HudAlpha.Get(
-            __instance.gameObject);
+        Register(
+            HudAlpha.Get(
+                __instance.gameObject));
+
+        Apply();
+    }
+
+    // Called every frame from iHUDPlugin.Update via HudDisplayManager.
+    public static void Tick()
+    {
+        state.Tick();
+        Apply();
+    }
+
+    // Called every frame from iHUDPlugin.LateUpdate, so our alpha is applied
+    // after other mods have run their own Update code.
+    public static void LateApply()
+    {
+        Apply();
+    }
+
+    private static void Register(CanvasGroup group)
+    {
+        groups.RemoveAll(g => g == null);
+
+        if (!groups.Contains(group))
+            groups.Add(group);
+    }
+
+    private static void Apply()
+    {
+        if (groups.Count == 0)
+            return;
 
         if (!iHUDPlugin.HotkeyBarHandling.Value ||
             !iHUDPlugin.Enabled)
         {
-            RestoreDefault();
+            if (controlling)
+            {
+                RestoreDefault();
+                controlling = false;
+            }
+
             return;
         }
+
+        controlling = true;
 
         if (HudDisplayManager.IsInventoryOpen)
         {
@@ -1907,7 +2019,7 @@ internal static class HotkeyBarController
         if (iHUDPlugin.HotkeyBarModeSetting.Value ==
             HotkeyBarMode.AlwaysHidden)
         {
-            group.alpha = 0f;
+            SetAlpha(0f);
             return;
         }
 
@@ -1920,16 +2032,18 @@ internal static class HotkeyBarController
         }
         else if (currentHash != previousItemHash)
         {
-            state.Show();
+            // 0 = nothing equipped. Putting a weapon away should not show
+            // the bar; only equipping something does.
+            if (currentHash != 0)
+                state.Show();
+
             previousItemHash = currentHash;
         }
 
-        state.Tick();
-
-        group.alpha =
+        SetAlpha(
             state.GetAlpha(
                 iHUDPlugin.HotkeyBarHideDelay.Value,
-                iHUDPlugin.HotkeyBarFadeDuration.Value);
+                iHUDPlugin.HotkeyBarFadeDuration.Value));
     }
 
     private static int GetEquippedItemHash(Player player)
@@ -1940,35 +2054,266 @@ internal static class HotkeyBarController
         if (item == null)
             return 0;
 
+        // GetCurrentWeapon falls back to the fists when nothing is held.
+        // Treat that as "nothing equipped".
+        if (!item.m_equipped)
+            return 0;
+
         return item.m_shared.m_name.GetHashCode();
+    }
+
+    private static void SetAlpha(float alpha)
+    {
+        foreach (CanvasGroup group in groups)
+        {
+            if (group != null)
+                group.alpha = alpha;
+        }
     }
 
     public static void ShowImmediately()
     {
         state.Show();
-
-        if (group != null)
-            group.alpha = 1f;
+        SetAlpha(1f);
     }
 
     public static void HideImmediately()
     {
         state.Hide();
-
-        if (group != null)
-            group.alpha = 0f;
+        SetAlpha(0f);
     }
 
     public static void RestoreDefault()
     {
         state.Hide();
+        SetAlpha(1f);
+    }
+}
+// Fades the ship's power icon (the oar / half sail / full sail icon under the
+// minimap) while steering. The wind indicator, the steering wheel and (by
+// default) the speed arrows stay untouched. The icon is shown when boarding
+// and whenever the sail setting changes, then fades out.
+[HarmonyPatch]
+internal static class ShipHudController
+{
+    // Name of the container (child of the ship HUD root) that holds the
+    // oar / half sail / full sail icons. Faded by default.
+    private const string PowerIconName = "PowerIcon";
 
-        if (group != null)
-            group.alpha = 1f;
+    // Used if the container is not found: its individual icons.
+    private static readonly string[] PowerIconFieldNames =
+    {
+        "m_rudder",
+        "m_halfSail",
+        "m_fullSail"
+    };
+
+    // The speed arrows above the steering wheel. Only faded when
+    // "Speed Indicator Handling" is enabled.
+    private static readonly string[] SpeedFieldNames =
+    {
+        "m_rudderSlow",
+        "m_rudderForward",
+        "m_rudderFastForward",
+        "m_rudderBackward"
+    };
+
+    private static readonly FieldInfo? ShipHudRootField =
+        AccessTools.Field(typeof(Hud), "m_shipHudRoot");
+
+    private static readonly HudFadeState state =
+        new HudFadeState();
+
+    private static readonly List<CanvasGroup> groups =
+        new List<CanvasGroup>();
+
+    private static Hud? lastHud;
+    private static bool builtSpeedHandling;
+
+    private static int previousSpeed = -1;
+
+    // Skip this patch cleanly if the game version has no such method.
+    private static bool Prepare()
+    {
+        bool found =
+            AccessTools.Method(typeof(Hud), "UpdateShipHud") != null;
+
+        if (!found)
+        {
+            iHUDPlugin.Log.LogWarning(
+                "Hud.UpdateShipHud not found. Ship HUD handling disabled.");
+        }
+
+        return found;
     }
 
-    public static void Tick()
+    private static MethodBase TargetMethod()
     {
+        return AccessTools.Method(typeof(Hud), "UpdateShipHud");
+    }
+
+    public static void Postfix(Hud __instance)
+    {
+        if (__instance != lastHud ||
+            builtSpeedHandling !=
+                iHUDPlugin.ShipHudSpeedIndicatorHandling.Value)
+        {
+            Rebuild(__instance);
+        }
+
+        if (groups.Count == 0)
+            return;
+
+        if (!iHUDPlugin.ShipHudHandling.Value ||
+            !iHUDPlugin.Enabled)
+        {
+            RestoreDefault();
+            return;
+        }
+
+        if (HudDisplayManager.IsInventoryOpen)
+        {
+            ShowImmediately();
+            return;
+        }
+
+        Player? player =
+            Player.m_localPlayer;
+
+        Ship? ship =
+            player != null
+                ? player.GetControlledShip()
+                : null;
+
+        if (ship == null)
+        {
+            // Not steering: forget the last setting so the next boarding
+            // counts as a change.
+            previousSpeed = -1;
+            return;
+        }
+
+        if (iHUDPlugin.ShipHudHideEntirely.Value)
+        {
+            SetAlpha(0f);
+            return;
+        }
+
+        int speed =
+            (int)ship.GetSpeedSetting();
+
+        if (speed != previousSpeed)
+            state.Show();
+
+        previousSpeed = speed;
+
+        state.Tick();
+
+        SetAlpha(
+            state.GetAlpha(
+                iHUDPlugin.ShipHudHideDelay.Value,
+                iHUDPlugin.ShipHudFadeDuration.Value));
+    }
+
+    private static void Rebuild(Hud hud)
+    {
+        // Restore anything that was faded before the rebuild.
+        SetAlpha(1f);
+
+        lastHud = hud;
+        builtSpeedHandling =
+            iHUDPlugin.ShipHudSpeedIndicatorHandling.Value;
+
+        groups.Clear();
+
+        List<string> found = new List<string>();
+        List<string> missing = new List<string>();
+        List<string> wanted = new List<string>();
+
+        GameObject? root =
+            ShipHudRootField?.GetValue(hud) as GameObject;
+
+        Transform? powerIcon =
+            root != null
+                ? root.transform.Find(PowerIconName)
+                : null;
+
+        if (powerIcon != null)
+        {
+            groups.Add(HudAlpha.Get(powerIcon.gameObject));
+            found.Add(PowerIconName);
+        }
+        else
+        {
+            wanted.AddRange(PowerIconFieldNames);
+        }
+
+        if (builtSpeedHandling)
+            wanted.AddRange(SpeedFieldNames);
+
+        foreach (string name in wanted)
+        {
+            FieldInfo? field = AccessTools.Field(typeof(Hud), name);
+            GameObject? obj = field != null
+                ? ToGameObject(field.GetValue(hud))
+                : null;
+
+            if (obj == null)
+            {
+                missing.Add(name);
+                continue;
+            }
+
+            groups.Add(HudAlpha.Get(obj));
+            found.Add(name);
+        }
+
+        if (found.Count > 0)
+        {
+            iHUDPlugin.Log.LogInfo(
+                "Ship HUD: fading " + string.Join(", ", found));
+        }
+
+        if (missing.Count > 0)
+        {
+            iHUDPlugin.Log.LogWarning(
+                "Ship HUD: objects not found: " +
+                string.Join(", ", missing));
+        }
+    }
+
+    private static GameObject? ToGameObject(object? value)
+    {
+        return value as GameObject ??
+               (value as Component)?.gameObject;
+    }
+
+    private static void SetAlpha(float alpha)
+    {
+        foreach (CanvasGroup group in groups)
+        {
+            if (group != null)
+                group.alpha = alpha;
+        }
+    }
+
+    public static void ShowImmediately()
+    {
+        state.Show();
+        SetAlpha(1f);
+    }
+
+    public static void HideImmediately()
+    {
+        state.Hide();
+        SetAlpha(0f);
+    }
+
+    public static void RestoreDefault()
+    {
+        state.Hide();
+        previousSpeed = -1;
+        SetAlpha(1f);
     }
 }
 [HarmonyPatch(typeof(Hud), "UpdateGuardianPower")]
