@@ -10,7 +10,7 @@ using System.Globalization;
 using System.Linq;
 using System.Reflection;
 
-[BepInPlugin("iHUD", "iHUD", "1.1.1")]
+[BepInPlugin("iHUD", "iHUD", "1.1.2")]
 public sealed class iHUDPlugin : BaseUnityPlugin
 {
     internal static bool Enabled = true;
@@ -45,6 +45,8 @@ public sealed class iHUDPlugin : BaseUnityPlugin
     internal static ConfigEntry<bool> ShowAllOnInventory = null!;
     internal static ConfigEntry<bool> ToggleMessage = null!;
     internal static ConfigEntry<bool> HideDamageNumbers = null!;
+    internal static ConfigEntry<bool> HideOtherModHud = null!;
+    internal static ConfigEntry<string> OtherModHudNeverHide = null!;
     internal static ConfigEntry<bool> ShipHudHandling = null!;
     internal static ConfigEntry<float> ShipHudHideDelay = null!;
     internal static ConfigEntry<float> ShipHudFadeDuration = null!;
@@ -519,6 +521,27 @@ public sealed class iHUDPlugin : BaseUnityPlugin
             "If enabled, the speed arrows above the steering wheel also " +
             "fade when they are not needed. Off by default so the current " +
             "speed setting stays visible.");
+
+        // -----------------------------------------------------------------
+        // Other mods
+        // -----------------------------------------------------------------
+
+        HideOtherModHud = Config.Bind(
+            "Other Mods",
+            "Hide Other Mod HUD",
+            false,
+            "Try to hide HUD elements that other mods add to the game's " +
+            "HUD while iHUD is enabled. Windows and popups that contain " +
+            "buttons or inputs are left alone. Toggle iHUD off to see " +
+            "everything again. Hidden elements are listed in the BepInEx log.");
+
+        OtherModHudNeverHide = Config.Bind(
+            "Other Mods",
+            "Never Hide",
+            "",
+            "Comma-separated name fragments. HUD elements whose name " +
+            "contains one of these are never hidden (element names are " +
+            "listed in the BepInEx log).");
 
         // -----------------------------------------------------------------
         // Minimap
@@ -1935,10 +1958,16 @@ internal static class CrosshairController
             shared.m_attack.m_attackType ==
             Attack.AttackType.Projectile;
 
+        // Spears throw with their secondary attack.
+        bool secondaryProjectile =
+            shared.m_secondaryAttack != null &&
+            shared.m_secondaryAttack.m_attackType ==
+            Attack.AttackType.Projectile;
+
         bool ammo =
             shared.m_ammoType != string.Empty;
 
-        return projectile || ammo;
+        return projectile || secondaryProjectile || ammo;
     }
 }
 [HarmonyPatch(typeof(HotkeyBar), "UpdateIcons")]
