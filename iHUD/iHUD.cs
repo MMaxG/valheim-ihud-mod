@@ -10,7 +10,7 @@ using System.Globalization;
 using System.Linq;
 using System.Reflection;
 
-[BepInPlugin("iHUD", "iHUD", "1.1.0")]
+[BepInPlugin("iHUD", "iHUD", "1.1.1")]
 public sealed class iHUDPlugin : BaseUnityPlugin
 {
     internal static bool Enabled = true;
@@ -44,6 +44,7 @@ public sealed class iHUDPlugin : BaseUnityPlugin
     internal static ConfigEntry<bool> MinimapHandling = null!;
     internal static ConfigEntry<bool> ShowAllOnInventory = null!;
     internal static ConfigEntry<bool> ToggleMessage = null!;
+    internal static ConfigEntry<bool> HideDamageNumbers = null!;
     internal static ConfigEntry<bool> ShipHudHandling = null!;
     internal static ConfigEntry<float> ShipHudHideDelay = null!;
     internal static ConfigEntry<float> ShipHudFadeDuration = null!;
@@ -353,6 +354,13 @@ public sealed class iHUDPlugin : BaseUnityPlugin
             "Toggle Message",
             true,
             "Show a short on-screen message when iHUD is toggled on/off.");
+
+        HideDamageNumbers = Config.Bind(
+            "General",
+            "Hide Damage Numbers",
+            false,
+            "Hide the floating damage numbers (damage dealt and taken, " +
+            "healing, blocked, etc.). Only applies while iHUD is enabled.");
 
         // -----------------------------------------------------------------
         // Health
@@ -1943,7 +1951,17 @@ internal static class HotkeyBarController
     private static readonly List<CanvasGroup> groups =
         new List<CanvasGroup>();
 
-    private static int previousItemHash = -1;
+    // Hand items (weapons, tools, shields, torches...). Humanoid keeps them
+    // in protected fields, so they are read by reflection.
+    private static readonly FieldInfo? RightItemField =
+        AccessTools.Field(typeof(Humanoid), "m_rightItem");
+
+    private static readonly FieldInfo? LeftItemField =
+        AccessTools.Field(typeof(Humanoid), "m_leftItem");
+
+    private static bool hasPreviousItems;
+    private static int previousRightHash;
+    private static int previousLeftHash;
 
     // True while iHUD is driving the bar's alpha. Used to restore the
     // default once (instead of every frame) when iHUD stops controlling it,
@@ -2023,22 +2041,28 @@ internal static class HotkeyBarController
             return;
         }
 
-        int currentHash =
-            GetEquippedItemHash(player);
+        GetHandItemHashes(player, out int rightHash, out int leftHash);
 
-        if (previousItemHash == -1)
+        if (!hasPreviousItems)
         {
-            previousItemHash = currentHash;
+            hasPreviousItems = true;
         }
-        else if (currentHash != previousItemHash)
+        else if (rightHash != previousRightHash ||
+                 leftHash != previousLeftHash)
         {
-            // 0 = nothing equipped. Putting a weapon away should not show
-            // the bar; only equipping something does.
-            if (currentHash != 0)
+            // 0 = empty hand. Only equipping something (a hand that now
+            // holds a different item) shows the bar; putting an item away
+            // does not.
+            bool equipped =
+                (rightHash != 0 && rightHash != previousRightHash) ||
+                (leftHash != 0 && leftHash != previousLeftHash);
+
+            if (equipped)
                 state.Show();
-
-            previousItemHash = currentHash;
         }
+
+        previousRightHash = rightHash;
+        previousLeftHash = leftHash;
 
         SetAlpha(
             state.GetAlpha(
@@ -2046,20 +2070,38 @@ internal static class HotkeyBarController
                 iHUDPlugin.HotkeyBarFadeDuration.Value));
     }
 
-    private static int GetEquippedItemHash(Player player)
+    private static void GetHandItemHashes(
+        Player player,
+        out int rightHash,
+        out int leftHash)
     {
-        ItemDrop.ItemData item =
-            player.GetCurrentWeapon();
+        if (RightItemField == null || LeftItemField == null)
+        {
+            // Fallback: only the current weapon is tracked.
+            ItemDrop.ItemData? weapon =
+                player.GetCurrentWeapon();
 
-        if (item == null)
-            return 0;
+            rightHash =
+                weapon != null && weapon.m_equipped
+                    ? ItemHash(weapon)
+                    : 0;
 
-        // GetCurrentWeapon falls back to the fists when nothing is held.
-        // Treat that as "nothing equipped".
-        if (!item.m_equipped)
-            return 0;
+            leftHash = 0;
+            return;
+        }
 
-        return item.m_shared.m_name.GetHashCode();
+        rightHash =
+            ItemHash(RightItemField.GetValue(player) as ItemDrop.ItemData);
+
+        leftHash =
+            ItemHash(LeftItemField.GetValue(player) as ItemDrop.ItemData);
+    }
+
+    private static int ItemHash(ItemDrop.ItemData? item)
+    {
+        return item == null
+            ? 0
+            : item.m_shared.m_name.GetHashCode();
     }
 
     private static void SetAlpha(float alpha)
@@ -2089,6 +2131,68 @@ internal static class HotkeyBarController
         SetAlpha(1f);
     }
 }
+// Suppresses the floating damage numbers. Both locally caused and remote
+// numbers arrive through the same game method, so one hook covers all.
+[HarmonyPatch]
+internal static class DamageTextController
+{
+    // Tried in order; the first one that exists in this game version wins.
+    private static readonly string[] CandidateNames =
+    {
+        "AddInworldText",
+        "RPC_DamageText"
+    };
+
+    private static readonly MethodBase? target =
+        FindTarget();
+
+    private static MethodBase? FindTarget()
+    {
+        foreach (string name in CandidateNames)
+        {
+            try
+            {
+                MethodBase? method =
+                    AccessTools.Method(typeof(DamageText), name);
+
+                if (method != null)
+                    return method;
+            }
+            catch (AmbiguousMatchException)
+            {
+                // Try the next candidate.
+            }
+        }
+
+        return null;
+    }
+
+    // Skip this patch cleanly if the game version has no such method.
+    private static bool Prepare()
+    {
+        if (target == null)
+        {
+            iHUDPlugin.Log.LogWarning(
+                "DamageText method not found. " +
+                "Hide Damage Numbers disabled.");
+        }
+
+        return target != null;
+    }
+
+    private static MethodBase TargetMethod()
+    {
+        return target!;
+    }
+
+    // Returning false skips the original method (no number is created).
+    public static bool Prefix()
+    {
+        return !(iHUDPlugin.Enabled &&
+                 iHUDPlugin.HideDamageNumbers.Value);
+    }
+}
+
 // Fades the ship's power icon (the oar / half sail / full sail icon under the
 // minimap) while steering. The wind indicator, the steering wheel and (by
 // default) the speed arrows stay untouched. The icon is shown when boarding
